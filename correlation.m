@@ -23,6 +23,7 @@ for i=1:fileNumber2
     data=data*0.1; %gc month
     data=reshape(data,101*125,1);
     FLDAS_SM_sum(:,i) = data;
+    
 end
 
 Colm_FLDAS_xgx =zeros(101,125);
