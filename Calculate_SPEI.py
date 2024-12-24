@@ -25,36 +25,46 @@ prcp = prcp.astype(np.float64)
 print(prcp.shape)
 nt,nlat,nlon = prcp.shape
 
-pet_file = r'H:\precipitation\PreMonthy\pet_1990_2021.nc'
-pet_fh = Dataset(pet_file, mode='r') # file handle, open in read only mode
-pet_fh.set_auto_mask(False)
-pet = pet_fh.variables['etp'][:]
-pet_fh.close()
+tmp_file = r'H:\precipitation\PreMonthy\tmp_1990_2021.nc'
+tmp_fh = Dataset(pet_file, mode='r') # file handle, open in read only mode
+tmp_fh.set_auto_mask(False)
+tmp = tmp_fh.variables['tmp'][:]
+tmp_fh.close()
 
-pet = np.ma.MaskedArray(pet, mask=mask)
-pet = pet.astype(np.float64)
-print(pet.shape)
+tmp = np.ma.MaskedArray(pet, mask=mask)
+tmp = pet.astype(np.float64)
+
+print(tmp.shape)
 
 
 
 spei = np.zeros(pet.shape)
 spei[:,:,:] = np.nan
+pet = np.zeros(tmp.shape)
+pet[:,:,:] = np.nan
 nrun = 12
 
 for ilat in np.arange(nlat):
     lat = lats[ilat]
     for ilon in np.arange(nlon):
+        
         one_pr = prcp[:, ilat, ilon]
-        one_pet = pet[:, ilat, ilon]
-        spei[:, ilat, ilon] = indices.spei(precips_mm=one_pr,
-                                           pet_mm=one_pet,
-                                           scale=nrun,
-                                           distribution=indices.Distribution.gamma,
-                                           periodicity=compute.Periodicity.monthly,
-                                           data_start_year=1990,
-                                           calibration_year_initial=1990,
-                                           calibration_year_final=2021,
-                                           )
+        one_tmp = tmp[:,ilat,ilon]
+
+        if(not np.ma.is_masked(one_pr)):
+            one_pet = indices.pet(temperature_celsius=one_tmp,
+                                 latitude_degrees=lat,
+                                 data_start_year=1990)
+            pet[:,ilat,ilon] = one_pet
+            spei[:, ilat, ilon] = indices.spei(precips_mm=one_pr,
+                                               pet_mm=one_pet,
+                                               scale=nrun,
+                                               distribution=indices.Distribution.gamma,
+                                               periodicity=compute.Periodicity.monthly,
+                                               data_start_year=1990,
+                                               calibration_year_initial=1990,
+                                               calibration_year_final=2021,
+                                               )
 
 
 #pet = np.ma.MaskedArray(pet, mask=mask)
