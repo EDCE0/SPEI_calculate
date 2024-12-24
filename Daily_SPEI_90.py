@@ -64,6 +64,7 @@ def save_tiff(data, save_path, geotransform, projection):
 def calculate_spei(precip, pet, nrun, start_year, end_year):
     """计算SPEI指数"""
     try:
+        
         return indices.spei(
             precips_mm=precip,
             pet_mm=pet,
@@ -91,12 +92,12 @@ def main():
     # 读取数据
     print("Reading input data...")
     prcp, undef, lons, lats = read_netcdf(r'H:\precipitation\PreDaily\precipitation_1960_2025.nc', 'pre')  # 使用每日数据
-    pet = read_netcdf(r'H:\precipitation\PreDaily\pet_1960_2025.nc', 'etp')  # 使用每日数据
+    tmp = read_netcdf(r'H:\precipitation\PreDaily\tmp_1960_2025.nc', 'tmp')  # 使用每日数据
 
     # 创建掩膜
     mask = (prcp == undef)
     prcp = np.ma.MaskedArray(prcp, mask=mask).astype(np.float64)
-    pet = np.ma.MaskedArray(pet, mask=mask).astype(np.float64)
+    tmp = np.ma.MaskedArray(tmp, mask=mask).astype(np.float64)
 
     # 获取维度
     nt, nlat, nlon = prcp.shape
@@ -117,14 +118,14 @@ def main():
             if not mask[:, ilat, ilon].all():  # 只处理非完全掩膜的像素
                 spei[:, ilat, ilon] = calculate_spei(
                     prcp[:, ilat, ilon],
-                    pet[:, ilat, ilon],
+                    tmp[:, ilat, ilon],
                     nrun,
                     start_year,
                     end_year
                 )
 
     # 清理内存
-    del prcp, pet
+    del prcp, tmp
     gc.collect()
 
     # 保存结果
