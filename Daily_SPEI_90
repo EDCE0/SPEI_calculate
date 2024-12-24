@@ -80,9 +80,9 @@ def calculate_spei(precip, pet, nrun, start_year, end_year):
 
 def main():
     # 参数设置
-    start_year = 1990
-    end_year = 2021
-    nrun = 3  # SPEI-3，表示3天的尺度
+    start_year = 1960
+    end_year = 2025
+    nrun = 90  # SPEI-90，表示3天的尺度
     output_dir = "spei_output"
     
     # 创建输出目录
@@ -90,8 +90,8 @@ def main():
 
     # 读取数据
     print("Reading input data...")
-    prcp, undef, lons, lats = read_netcdf(r'H:\precipitation\PreDaily\precipitation_1990_2021.nc', 'pre')  # 使用每日数据
-    pet = read_netcdf(r'H:\precipitation\PreDaily\pet_1990_2021.nc', 'etp')  # 使用每日数据
+    prcp, undef, lons, lats = read_netcdf(r'H:\precipitation\PreDaily\precipitation_1960_2025.nc', 'pre')  # 使用每日数据
+    pet = read_netcdf(r'H:\precipitation\PreDaily\pet_1960_2025.nc', 'etp')  # 使用每日数据
 
     # 创建掩膜
     mask = (prcp == undef)
