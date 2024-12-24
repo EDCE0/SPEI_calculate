@@ -55,7 +55,7 @@ for ilat in np.arange(nlat):
             one_pet = indices.pet(temperature_celsius=one_tmp,
                                  latitude_degrees=lat,
                                  data_start_year=1990)
-            pet[:,ilat,ilon] = one_pet
+            #pet[:,ilat,ilon] = one_pet
             spei[:, ilat, ilon] = indices.spei(precips_mm=one_pr,
                                                pet_mm=one_pet,
                                                scale=nrun,
