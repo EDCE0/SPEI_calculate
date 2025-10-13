@@ -1,0 +1,511 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Copulas_windowed_blockmax.py
+
+功能：
+ - 从 NetCDF 读取逐月/逐日温度 (t2m) 与 SPEI（或你定义的两要素）
+ - 在每个网格点附近使用窗口（pool）收集事件（duration, severity）
+ - 拟合边际：duration -> LogNormal, severity -> Gamma（可改）
+ - 用 Gumbel copula 拟合联合依赖（Kendall tau 映射作为初始估计）
+ - 对中心格点的每年年最大事件计算联合超越概率并给出重现期（block-max 模式：T=1/P）
+ - 将每年结果输出为 NetCDF 文件
+ - 若数据量大，建议先在区域子域测试或并行化
+
+使用：修改下方 DATA_PATH, SPEI_DATA_PATH 然后运行
+"""
+import os
+import numpy as np
+import pandas as pd
+import xarray as xr
+from scipy.stats import expon, gamma, lognorm, kendalltau
+from joblib import Parallel, delayed
+
+# ---------------------------
+# Utility & statistical functions
+# ---------------------------
+def detect_annual_compound_events(tmp_series, spei_series, unique_years,
+                                  tmp_threshold, spei_threshold, duration_threshold):
+    """
+    对单个格点时间序列检测复合事件（按年分组）。
+    假定 time dimension 可通过 tmp_series.time 获取（xarray DataArray）。
+    返回：
+      grid_annual_max_duration (len years)
+      grid_annual_max_severity (len years)
+      all_durations (list) -- 所有事件的持续天数/月数
+      all_severities (list) -- 对应 severity（定义为 sum((tmp - threshold) * (-spei))）
+      annual_average_duration (len years)
+      annual_frequency (len years) -- 每年事件个数
+      longest_event_start_day (len years) -- 可为 NaN 或 day index
+      longest_event_end_day (len years)
+      tmp_severity_list_all_events (list)
+      spei_severity_list_all_events (list)
+    """
+    # convert to pandas timeseries index
+    try:
+        time_index = pd.to_datetime(tmp_series.time.values)
+    except Exception:
+        # fallback: if no time coordinate, return empty
+        nyrs = len(unique_years)
+        return (np.full(nyrs, np.nan),)*11
+
+    df = pd.DataFrame({
+        'tmp': tmp_series.values,
+        'spei': spei_series.values
+    }, index=time_index)
+
+    n_years = len(unique_years)
+    grid_annual_max_duration = np.full(n_years, np.nan)
+    grid_annual_max_severity = np.full(n_years, np.nan)
+    annual_average_duration = np.full(n_years, np.nan)
+    annual_frequency = np.full(n_years, np.nan)
+    longest_start = np.full(n_years, np.nan)
+    longest_end = np.full(n_years, np.nan)
+
+    all_durations = []
+    all_severities = []
+    tmp_severity_list = []
+    spei_severity_list = []
+
+    for yi, year in enumerate(unique_years):
+        year_df = df[df.index.year == year]
+        if year_df.empty:
+            continue
+
+        events = []
+        current = []
+        # iterate rows
+        for idx, row in year_df.iterrows():
+            tmp_val = row['tmp']
+            spei_val = row['spei']
+            if np.isfinite(tmp_val) and np.isfinite(spei_val) and (tmp_val > tmp_threshold) and (spei_val < spei_threshold):
+                current.append((idx, tmp_val, spei_val))
+            else:
+                if len(current) >= duration_threshold:
+                    events.append(current)
+                current = []
+        # tail
+        if len(current) >= duration_threshold:
+            events.append(current)
+
+        if events:
+            durations = [len(ev) for ev in events]
+            # severity: sum((tmp - tmp_threshold) * (-spei)) so severity > 0 for drought
+            severities = [sum((t - tmp_threshold) * (-s) for _, t, s in ev) for ev in events]
+            tmp_sevs = [sum((t - tmp_threshold) for _, t, s in ev) for ev in events]
+            spei_sevs = [sum((-s) for _, t, s in ev) for ev in events]
+
+            # extend global lists
+            all_durations.extend(durations)
+            all_severities.extend(severities)
+            tmp_severity_list.extend(tmp_sevs)
+            spei_severity_list.extend(spei_sevs)
+
+            # annual metrics
+            grid_annual_max_duration[yi] = np.max(durations)
+            grid_annual_max_severity[yi] = np.max(severities)/np.max(durations)
+            annual_average_duration[yi] = np.mean(durations)
+            annual_frequency[yi] = len(durations)
+
+            # longest event start/end (as ordinal day)
+            longest_ev = events[np.argmax(durations)]
+            longest_start[yi] = (longest_ev[0][0] - pd.Timestamp(f"{year}-01-01")).days + 1
+            longest_end[yi] = (longest_ev[-1][0] - pd.Timestamp(f"{year}-01-01")).days + 1
+        else:
+            # no events in that year
+            annual_average_duration[yi] = 0.0
+            annual_frequency[yi] = 0.0
+
+    return (grid_annual_max_duration, grid_annual_max_severity,
+            np.array(all_durations), np.array(all_severities),
+            annual_average_duration, annual_frequency,
+            longest_start, longest_end,
+            np.array(tmp_severity_list), np.array(spei_severity_list))
+
+
+# Marginal fitting supporting 'lognormal' and 'gamma'
+def fit_marginal_distributions(data, dist_type):
+    data = np.asarray(data)
+    data = data[np.isfinite(data) & (data > 0)]  # only positive events
+    if len(data) < MIN_EVENTS_FOR_FIT:
+        return None
+    try:
+        if dist_type == 'gamma':
+            a, loc, scale = gamma.fit(data, floc=0.0)
+            return {'a': a, 'loc': loc, 'scale': scale}
+        elif dist_type == 'lognormal':
+            # fit lognormal: scipy's lognorm parameterization: s, loc, scale
+            s, loc, scale = lognorm.fit(data, floc=0.0)
+            return {'s': s, 'loc': loc, 'scale': scale}
+        elif dist_type == 'expon':
+            loc, scale = expon.fit(data, floc=0.0)
+            return {'loc': loc, 'scale': scale}
+        else:
+            return None
+    except Exception as e:
+        print("Marginal fit error:", e)
+        return None
+
+def get_cdf_value(x, params, dist_type):
+    if params is None:
+        return np.full_like(np.asarray(x, dtype=float), np.nan)
+    x = np.asarray(x, dtype=float)
+    if dist_type == 'gamma':
+        return gamma.cdf(x, a=params['a'], loc=params['loc'], scale=params['scale'])
+    elif dist_type == 'lognormal':
+        return lognorm.cdf(x, s=params['s'], loc=params['loc'], scale=params['scale'])
+    elif dist_type == 'expon':
+        return expon.cdf(x, loc=params['loc'], scale=params['scale'])
+    else:
+        return np.full_like(x, np.nan)
+
+# Gumbel copula CDF (u,v in (0,1), theta>=1)
+def gumbel_copula_cdf(u, v, theta):
+    u = np.clip(u, 1e-10, 1 - 1e-10)
+    v = np.clip(v, 1e-10, 1 - 1e-10)
+    if theta <= 1.0:
+        # theta==1 is independence => C(u,v)=u*v
+        return u * v
+    try:
+        term = ((-np.log(u))**theta + (-np.log(v))**theta) ** (1.0 / theta)
+        return np.exp(-term)
+    except Exception:
+        return u * v
+
+def fit_gumbel_copula(u_data, v_data):
+    # Simple method via Kendall's tau mapping: theta = 1 / (1 - tau) for Gumbel
+    if len(u_data) < 3:
+        return 1.0
+    tau, _ = kendalltau(u_data, v_data)
+    if np.isnan(tau) or tau <= 0:
+        return 1.0
+    if tau >= 0.9999:
+        return 100.0
+    theta = 1.0 / (1.0 - tau)
+    return max(theta, 1.0)
+
+def joint_exceedance_from_copula(u, v, theta):
+    # P(U>u,V>v) = 1 - u - v + C(u,v)
+    Cuv = gumbel_copula_cdf(u, v, theta)
+    p = 1.0 - u - v + Cuv
+    return max(min(p, 1.0), 0.0)
+
+# ---------------------------
+# USER CONFIGURATION
+# ---------------------------
+DATA_PATH = '/home/gjb/CN_max_tmp_1961_2022.nc'
+SPEI_DATA_PATH = '/home/gjb/combined_spei90.nc'
+TEMP_VAR = 't2m'
+SPEI_VAR = 'spei'
+TIME_NAME = 'time'
+LAT_NAME = 'lat'
+LON_NAME = 'lon'
+
+TMP_THRESHOLD = 305.15
+SPEI_THRESHOLD = -1.0
+DURATION_THRESHOLD = 3
+WINDOW_SIZE = 5
+MIN_EVENTS_FOR_FIT = 8
+MIN_EVENTS_FOR_POOL = 8
+OUTPUT_DIR = 'Compound_heatwave_drought_event_return_periods_netcdf'
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+MIN_P_EXCEED = 1e-8
+MAX_RETURN_PERIOD = 1000.0
+
+# ---------------------------
+# Load datasets
+# ---------------------------
+print("Loading datasets...")
+ds_tmp = xr.open_dataset(DATA_PATH)
+ds_spei = xr.open_dataset(SPEI_DATA_PATH)
+
+if 'longitude' in ds_tmp.coords and LON_NAME not in ds_tmp.coords:
+    ds_tmp = ds_tmp.rename({'longitude': LON_NAME})
+if 'latitude' in ds_tmp.coords and LAT_NAME not in ds_tmp.coords:
+    ds_tmp = ds_tmp.rename({'latitude': LAT_NAME})
+
+tmp_da = ds_tmp[TEMP_VAR].sel({LAT_NAME: slice(18, 54), LON_NAME: slice(72, 136)})
+spei_da = ds_spei[SPEI_VAR].sel({LAT_NAME: slice(18, 54), LON_NAME: slice(72, 136)})
+
+unique_years = np.unique(tmp_da[TIME_NAME].dt.year.values)
+n_years = len(unique_years)
+nlat = len(tmp_da[LAT_NAME].values)
+nlon = len(tmp_da[LON_NAME].values)
+lats = tmp_da[LAT_NAME].values
+lons = tmp_da[LON_NAME].values
+
+half_w = WINDOW_SIZE // 2
+# ---------------------------
+# 并行计算函数
+# ---------------------------
+def process_grid(i_lat, j_lon):
+    lat_val = lats[i_lat]
+    lon_val = lons[j_lon]
+
+    # define window
+    lat_min = max(i_lat - half_w, 0)
+    lat_max = min(i_lat + half_w + 1, nlat)
+    lon_min = max(j_lon - half_w, 0)
+    lon_max = min(j_lon + half_w + 1, nlon)
+
+    # pool events
+    pooled_durations, pooled_severities = [], []
+    pooled_event_count = 0
+    for ii in range(lat_min, lat_max):
+        for jj in range(lon_min, lon_max):
+            tmp_series = tmp_da.isel({LAT_NAME: ii, LON_NAME: jj})
+            spei_series = spei_da.isel({LAT_NAME: ii, LON_NAME: jj})
+            if np.all(np.isnan(tmp_series.values)) or np.all(np.isnan(spei_series.values)):
+                continue
+            (grid_ann_max_d, grid_ann_max_s,
+             all_d, all_s,
+             ann_avg_d, ann_freq,
+             start_day, end_day,
+             tmp_sev_arr, spei_sev_arr) = detect_annual_compound_events(
+                 tmp_series, spei_series, unique_years,
+                 TMP_THRESHOLD, SPEI_THRESHOLD, DURATION_THRESHOLD
+             )
+            if len(all_d) > 0:
+                pooled_durations.extend(list(all_d))
+                pooled_severities.extend(list(all_s))
+                pooled_event_count += len(all_d)
+
+    pooled_durations = np.array(pooled_durations)
+    pooled_severities = np.array(pooled_severities)
+
+    # center grid
+    center_tmp = tmp_da.isel({LAT_NAME: i_lat, LON_NAME: j_lon})
+    center_spei = spei_da.isel({LAT_NAME: i_lat, LON_NAME: j_lon})
+    (c_ann_max_d, c_ann_max_s, c_all_d, c_all_s,
+     c_ann_avg_d, c_ann_freq, c_start, c_end,
+     c_tmp_sevs, c_spei_sevs) = detect_annual_compound_events(
+         center_tmp, center_spei, unique_years,
+         TMP_THRESHOLD, SPEI_THRESHOLD, DURATION_THRESHOLD
+    )
+
+    rp_array = np.full(n_years, np.nan)
+    params_d = {}
+    params_s = {}
+    theta = np.nan
+    lambda_local = 0.0
+
+    if pooled_durations.size >= MIN_EVENTS_FOR_POOL and pooled_severities.size >= MIN_EVENTS_FOR_POOL:
+        params_d = fit_marginal_distributions(pooled_durations, 'lognormal')
+        params_s = fit_marginal_distributions(pooled_severities, 'gamma')
+        if params_d and params_s:
+            u_pool = get_cdf_value(pooled_durations, params_d, 'lognormal')
+            v_pool = get_cdf_value(pooled_severities, params_s, 'gamma')
+            valid_mask = ~np.isnan(u_pool) & ~np.isnan(v_pool)
+            if np.sum(valid_mask) >= MIN_EVENTS_FOR_FIT:
+                u_valid = u_pool[valid_mask]
+                v_valid = v_pool[valid_mask]
+                theta = fit_gumbel_copula(u_valid, v_valid)
+                lambda_local = pooled_event_count / (float(n_years) * ((lat_max - lat_min)*(lon_max - lon_min)))
+                for yi in range(n_years):
+                    dval = float(c_ann_max_d[yi])
+                    sval = float(c_ann_max_s[yi])
+                    if np.isnan(dval) or np.isnan(sval) or dval <= 0 or sval <= 0:
+                        continue
+                    u_val = get_cdf_value(dval, params_d, 'lognormal')
+                    v_val = get_cdf_value(sval, params_s, 'gamma')
+                    if np.isnan(u_val) or np.isnan(v_val):
+                        continue
+                    p_exceed = joint_exceedance_from_copula(u_val, v_val, theta)
+                    p_exceed = max(p_exceed, MIN_P_EXCEED)
+                    rp = min(1.0 / p_exceed, MAX_RETURN_PERIOD)
+                    rp_array[yi] = rp
+    else:
+        lambda_local = (len(c_all_d) / float(n_years)) if n_years > 0 else 0.0
+
+    return (i_lat, j_lon, c_ann_max_d, c_ann_max_s, c_ann_avg_d, c_ann_freq,
+            c_start, c_end, rp_array, params_d, params_s, theta, lambda_local)
+
+# ---------------------------
+# 并行执行
+# ---------------------------
+print("\nStart parallel processing...")
+results = Parallel(n_jobs=12, backend="loky", verbose=10)(
+    delayed(process_grid)(i, j) for i in range(nlat) for j in range(nlon)
+)
+
+# ---------------------------
+# 汇总结果
+# ---------------------------
+coords_year = {'year': unique_years, LAT_NAME: lats, LON_NAME: lons}
+all_years_duration = xr.DataArray(np.nan, dims=['year', LAT_NAME, LON_NAME], coords=coords_year)
+all_years_severity = xr.DataArray(np.nan, dims=['year', LAT_NAME, LON_NAME], coords=coords_year)
+all_years_return_period = xr.DataArray(np.nan, dims=['year', LAT_NAME, LON_NAME], coords=coords_year)
+all_years_average_duration = xr.DataArray(np.nan, dims=['year', LAT_NAME, LON_NAME], coords=coords_year)
+all_years_frequency = xr.DataArray(np.nan, dims=['year', LAT_NAME, LON_NAME], coords=coords_year)
+longest_event_start_day = xr.DataArray(np.nan, dims=['year', LAT_NAME, LON_NAME], coords=coords_year)
+longest_event_end_day = xr.DataArray(np.nan, dims=['year', LAT_NAME, LON_NAME], coords=coords_year)
+
+duration_s = xr.DataArray(np.nan, dims=[LAT_NAME, LON_NAME], coords={LAT_NAME: lats, LON_NAME: lons})
+duration_loc = xr.DataArray(np.nan, dims=[LAT_NAME, LON_NAME], coords={LAT_NAME: lats, LON_NAME: lons})
+duration_scale = xr.DataArray(np.nan, dims=[LAT_NAME, LON_NAME], coords={LAT_NAME: lats, LON_NAME: lons})
+severity_a = xr.DataArray(np.nan, dims=[LAT_NAME, LON_NAME], coords={LAT_NAME: lats, LON_NAME: lons})
+severity_loc = xr.DataArray(np.nan, dims=[LAT_NAME, LON_NAME], coords={LAT_NAME: lats, LON_NAME: lons})
+severity_scale = xr.DataArray(np.nan, dims=[LAT_NAME, LON_NAME], coords={LAT_NAME: lats, LON_NAME: lons})
+copula_theta_grid = xr.DataArray(np.nan, dims=[LAT_NAME, LON_NAME], coords={LAT_NAME: lats, LON_NAME: lons})
+all_locations_lambda = xr.DataArray(np.nan, dims=[LAT_NAME, LON_NAME], coords={LAT_NAME: lats, LON_NAME: lons})
+
+for r in results:
+    (i, j, c_ann_max_d, c_ann_max_s, c_ann_avg_d, c_ann_freq,
+     c_start, c_end, rp_array, params_d, params_s, theta, lambda_local) = r
+    all_years_duration[:, i, j] = c_ann_max_d
+    all_years_severity[:, i, j] = c_ann_max_s
+    all_years_average_duration[:, i, j] = c_ann_avg_d
+    all_years_frequency[:, i, j] = c_ann_freq
+    longest_event_start_day[:, i, j] = c_start
+    longest_event_end_day[:, i, j] = c_end
+    all_years_return_period[:, i, j] = rp_array
+    if params_d:
+        duration_s[i, j] = params_d.get('s', np.nan)
+        duration_loc[i, j] = params_d.get('loc', np.nan)
+        duration_scale[i, j] = params_d.get('scale', np.nan)
+    if params_s:
+        severity_a[i, j] = params_s.get('a', np.nan)
+        severity_loc[i, j] = params_s.get('loc', np.nan)
+        severity_scale[i, j] = params_s.get('scale', np.nan)
+    copula_theta_grid[i, j] = theta
+    all_locations_lambda[i, j] = lambda_local
+
+# ---------------------------
+# 保存结果
+# ---------------------------
+print("\nSaving yearly NetCDF outputs...")
+for yi, year in enumerate(unique_years):
+    ds_out = xr.Dataset({
+        'duration': all_years_duration.isel(year=yi),
+        'severity': all_years_severity.isel(year=yi),
+        'return_period': all_years_return_period.isel(year=yi),
+        'avg_duration': all_years_average_duration.isel(year=yi),
+        'freq': all_years_frequency.isel(year=yi),
+        'start_day': longest_event_start_day.isel(year=yi),
+        'end_day': longest_event_end_day.isel(year=yi)
+    })
+    outname = os.path.join(OUTPUT_DIR, f'Compound_metrics_{year}.nc')
+    ds_out.to_netcdf(outname, engine='netcdf4')
+    print(f"  Saved: {outname}")
+
+diag_ds = xr.Dataset({
+    'duration_s': duration_s,
+    'duration_loc': duration_loc,
+    'duration_scale': duration_scale,
+    'severity_a': severity_a,
+    'severity_loc': severity_loc,
+    'severity_scale': severity_scale,
+    'copula_theta': copula_theta_grid,
+    'lambda_local': all_locations_lambda
+})
+diag_ds.to_netcdf(os.path.join(OUTPUT_DIR, 'diagnostics_parameters.nc'), engine='netcdf4')
+print("Saved diagnostics_parameters.nc")
+
+print("\nAll done.")
+
+
+# ---------------------------
+# Diagnostics plotting (optional)
+# ---------------------------
+
+
+# def diagnostic_plots(i_lat, j_lon, pooled_durations, pooled_severities,
+                     # params_d, params_s, theta):
+    # """
+    # 绘制边际分布拟合和联合概率拟合效果
+    # """
+    # fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    # #---- 1. 边际分布检验 ----
+    # #Duration
+    # sorted_d = np.sort(pooled_durations)
+    # ecdf_d = np.arange(1, len(sorted_d)+1) / len(sorted_d)
+    # fitted_cdf_d = get_cdf_value(sorted_d, params_d, 'lognormal')
+    # axes[0].plot(sorted_d, ecdf_d, 'o', label='Empirical CDF (Duration)')
+    # axes[0].plot(sorted_d, fitted_cdf_d, '-', label='Fitted LogNormal CDF')
+    # axes[0].set_xlabel("Duration")
+    # axes[0].set_ylabel("CDF")
+    # axes[0].legend()
+    # axes[0].set_title("Duration Marginal Fit")
+
+    # #Severity
+    # sorted_s = np.sort(pooled_severities)
+    # ecdf_s = np.arange(1, len(sorted_s)+1) / len(sorted_s)
+    # fitted_cdf_s = get_cdf_value(sorted_s, params_s, 'gamma')
+    # axes[1].plot(sorted_s, ecdf_s, 'x', label='Empirical CDF (Severity)')
+    # axes[1].plot(sorted_s, fitted_cdf_s, '--', label='Fitted Gamma CDF')
+    # axes[1].set_xlabel("Severity")
+    # axes[1].set_ylabel("CDF")
+    # axes[1].legend()
+    # axes[1].set_title("Severity Marginal Fit")
+
+    # #---- 2. Copula 检验 ----
+    # # u = get_cdf_value(pooled_durations, params_d, 'lognormal')
+    # # v = get_cdf_value(pooled_severities, params_s, 'gamma')
+    # # mask = ~np.isnan(u) & ~np.isnan(v)
+    # # u = u[mask]; v = v[mask]
+
+    # #经验联合概率 (基于高分位阈)
+    # # quantiles = [0.8, 0.9, 0.95]
+    # # emp_probs = []
+    # # cop_probs = []
+    # # for q in quantiles:
+        # # uq = np.quantile(u, q)
+        # # vq = np.quantile(v, q)
+        # # emp_prob = np.mean((u > uq) & (v > vq))
+        # # cop_prob = joint_exceedance_from_copula(uq, vq, theta)
+        # # emp_probs.append(emp_prob)
+        # # cop_probs.append(cop_prob)
+
+    # # axes[1].plot(quantiles, emp_probs, 'o-', label='Empirical exceed prob')
+    # # axes[1].plot(quantiles, cop_probs, 's--', label='Copula predicted prob')
+    # # axes[1].set_xlabel("Quantile threshold q")
+    # # axes[1].set_ylabel("P(U>uq,V>vq)")
+    # # axes[1].legend()
+    # # axes[1].set_title("Joint exceedance probability")
+
+    # plt.suptitle(f"Diagnostics at lat={lats[i_lat]:.2f}, lon={lons[j_lon]:.2f}")
+    # plt.tight_layout()
+    # output_path = '/home/gjb/copulas.png'
+    # plt.savefig(output_path, dpi=300, bbox_inches='tight')
+
+
+# # ---------------------------
+# # Example usage:
+# # ---------------------------
+# # 在运行完主循环后，手动选一个格点调用：
+# # 例如检查 i_lat=30, j_lon=40
+# # 需要重新取出 pooled_durations, pooled_severities 和拟合参数
+
+# i_lat, j_lon = 10, 10
+# lat_val = lats[i_lat]; lon_val = lons[j_lon]
+# # 定义窗口
+# lat_min = max(i_lat - half_w, 0); lat_max = min(i_lat + half_w + 1, nlat)
+# lon_min = max(j_lon - half_w, 0); lon_max = min(j_lon + half_w + 1, nlon)
+# pooled_durations, pooled_severities = [], []
+# for ii in range(lat_min, lat_max):
+    # for jj in range(lon_min, lon_max):
+        # tmp_series = tmp_da.isel({LAT_NAME: ii, LON_NAME: jj})
+        # spei_series = spei_da.isel({LAT_NAME: ii, LON_NAME: jj})
+        # (grid_ann_max_d, grid_ann_max_s, all_d, all_s,
+         # ann_avg_d, ann_freq, start_day, end_day,
+         # tmp_sev_arr, spei_sev_arr) = detect_annual_compound_events(
+            # tmp_series, spei_series, unique_years,
+            # TMP_THRESHOLD, SPEI_THRESHOLD, DURATION_THRESHOLD
+        # )
+        # pooled_durations.extend(list(all_d))
+        # pooled_severities.extend(list(all_s))
+# pooled_durations = np.array(pooled_durations)
+# pooled_severities = np.array(pooled_severities)
+
+# params_d = {'s': duration_s[i_lat, j_lon].item(),
+            # 'loc': duration_loc[i_lat, j_lon].item(),
+            # 'scale': duration_scale[i_lat, j_lon].item()}
+# params_s = {'a': severity_a[i_lat, j_lon].item(),
+            # 'loc': severity_loc[i_lat, j_lon].item(),
+            # 'scale': severity_scale[i_lat, j_lon].item()}
+# theta = copula_theta_grid[i_lat, j_lon].item()
+
+# diagnostic_plots(i_lat, j_lon, pooled_durations, pooled_severities,
+                 # params_d, params_s, theta)
+
